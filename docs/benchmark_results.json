@@ -1,0 +1,46 @@
+{
+  "MLX-Serve": {
+    "1": {
+      "latency_avg": 1.52,
+      "tps_total": 84.41,
+      "tps_per_req": 84.45
+    },
+    "2": {
+      "latency_avg": 2.18,
+      "tps_total": 89.8,
+      "tps_per_req": 65.1
+    },
+    "4": {
+      "latency_avg": 3.51,
+      "tps_total": 91.38,
+      "tps_per_req": 46.28
+    },
+    "8": {
+      "latency_avg": 6.38,
+      "tps_total": 89.44,
+      "tps_per_req": 29.6
+    }
+  },
+  "Ollama": {
+    "1": {
+      "latency_avg": 3.65,
+      "tps_total": 37.78,
+      "tps_per_req": 37.79
+    },
+    "2": {
+      "latency_avg": 4.42,
+      "tps_total": 43.53,
+      "tps_per_req": 32.44
+    },
+    "4": {
+      "latency_avg": 7.28,
+      "tps_total": 43.73,
+      "tps_per_req": 22.62
+    },
+    "8": {
+      "latency_avg": 14.52,
+      "tps_total": 39.54,
+      "tps_per_req": 13.56
+    }
+  }
+}
