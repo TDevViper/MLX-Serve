@@ -13,6 +13,7 @@ from engine.model_runner import runner
 from engine.kv_cache import kv_cache
 from engine.memory_monitor import MemoryMonitor
 from engine.embedder import embedder
+from engine.prefix_cache import prefix_cache
 from scheduler.continuous_batcher import batcher, Sequence as BatchSequence
 from core.config import load_config
 from scheduler.queue import RequestQueue, InferenceRequest
@@ -239,6 +240,11 @@ async def _stream_batch(seq, model_name: str):
         yield {"data": json.dumps({"id": req_id, "object": "chat.completion.chunk",
             "created": created, "model": model_name,
             "choices": [{"index": 0, "delta": {"content": token}, "finish_reason": None}]})}
+
+@app.get("/v1/prefix_cache")
+async def prefix_cache_stats():
+    """Prefix cache hit rate and stats."""
+    return prefix_cache.stats()
 
 @app.get("/v1/kv_cache")
 async def kv_cache_stats():
