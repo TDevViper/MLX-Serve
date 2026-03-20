@@ -12,18 +12,23 @@ from core.stats import stats
 from engine.model_runner import runner
 from engine.kv_cache import kv_cache
 from engine.memory_monitor import MemoryMonitor
+from engine.embedder import embedder
 from core.config import load_config
 from scheduler.queue import RequestQueue, InferenceRequest
 from scheduler.worker import InferenceWorker
 from scheduler.preemptor import Preemptor
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List, Union
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 cfg    = load_config()
-app    = FastAPI(title="MLX-Serve", version="0.6.0")
+app    = FastAPI(
+    title="MLX-Serve",
+    version="0.7.0",
+    description="OpenAI-compatible LLM inference server for Apple Silicon",
+)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 AVAILABLE_MODELS = [
@@ -32,15 +37,21 @@ AVAILABLE_MODELS = [
     "mlx-community/Mistral-7B-Instruct-v0.3-4bit",
     "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit",
 ]
+EMBEDDING_MODELS = [
+    "sentence-transformers/all-MiniLM-L6-v2",
+    "BAAI/bge-small-en-v1.5",
+]
 
-queue      = RequestQueue(max_concurrent=cfg.server.max_concurrent_requests)
-worker     = InferenceWorker(queue)
+queue       = RequestQueue(max_concurrent=cfg.server.max_concurrent_requests)
+worker      = InferenceWorker(queue)
 mem_monitor = MemoryMonitor(kv_cache, poll_interval=1.0)
-preemptor  = Preemptor(kv_cache)
+preemptor   = Preemptor(kv_cache)
 
 @app.on_event("startup")
 async def startup():
-    await asyncio.get_event_loop().run_in_executor(None, runner.load, cfg.model.default)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, runner.load, cfg.model.default)
+    await loop.run_in_executor(None, embedder.load, "sentence-transformers/all-MiniLM-L6-v2")
     await worker.start()
     await mem_monitor.start()
     preemptor.attach(queue, mem_monitor)
@@ -51,6 +62,7 @@ async def shutdown():
     await worker.stop()
     await mem_monitor.stop()
 
+# ── Health & metrics ──────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
     return {
@@ -61,6 +73,7 @@ async def health():
         "queue":     queue.stats(),
         "metrics":   metrics.summary(),
         "memory":    mem_monitor.current(),
+        "embedder":  {"model": embedder.model_name, "dim": embedder.dim()},
     }
 
 @app.get("/metrics", response_class=PlainTextResponse)
@@ -71,29 +84,13 @@ async def prometheus_metrics():
         mem_stats=mem_monitor.stats(),
     )
 
+# ── OpenAI-compatible endpoints ───────────────────────────────────────────────
 @app.get("/v1/models", response_model=ModelList)
 async def list_models():
+    all_models = AVAILABLE_MODELS + EMBEDDING_MODELS
     return ModelList(data=[
-        ModelCard(id=m, created=int(time.time())) for m in AVAILABLE_MODELS
+        ModelCard(id=m, created=int(time.time())) for m in all_models
     ])
-
-@app.get("/v1/kv_cache")
-async def kv_cache_stats():
-    s = kv_cache.stats()
-    s["memory_efficiency"] = f"{round((1 - s['utilization']) * 100, 1)}% free"
-    return s
-
-@app.get("/v1/memory")
-async def memory_stats():
-    return mem_monitor.stats()
-
-@app.get("/v1/stats")
-async def model_stats():
-    return {
-        "models":  stats.all(),
-        "summary": metrics.summary(),
-        "queue":   queue.stats(),
-    }
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest):
@@ -153,6 +150,58 @@ async def completions(req: CompletionRequest):
         }
     }
 
+class EmbeddingRequest(BaseModel):
+    model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    input: Union[str, List[str]]
+    encoding_format: str = "float"
+
+@app.post("/v1/embeddings")
+async def create_embeddings(req: EmbeddingRequest):
+    if not embedder.is_loaded():
+        raise HTTPException(503, "Embedding model not loaded yet")
+    texts = [req.input] if isinstance(req.input, str) else req.input
+    loop = asyncio.get_event_loop()
+    try:
+        vectors = await loop.run_in_executor(None, embedder.embed, texts)
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    return {
+        "object": "list",
+        "model":  req.model,
+        "data": [
+            {
+                "object":    "embedding",
+                "index":     i,
+                "embedding": vec,
+            }
+            for i, vec in enumerate(vectors)
+        ],
+        "usage": {
+            "prompt_tokens": sum(len(t.split()) for t in texts),
+            "total_tokens":  sum(len(t.split()) for t in texts),
+        }
+    }
+
+# ── Stats endpoints ───────────────────────────────────────────────────────────
+@app.get("/v1/kv_cache")
+async def kv_cache_stats():
+    s = kv_cache.stats()
+    s["memory_efficiency"] = f"{round((1 - s['utilization']) * 100, 1)}% free"
+    return s
+
+@app.get("/v1/memory")
+async def memory_stats():
+    return mem_monitor.stats()
+
+@app.get("/v1/stats")
+async def model_stats():
+    return {
+        "models":  stats.all(),
+        "summary": metrics.summary(),
+        "queue":   queue.stats(),
+    }
+
+# ── Streaming helpers ─────────────────────────────────────────────────────────
 async def _stream_tokens(inf_req, model_name):
     req_id  = f"chatcmpl-{inf_req.request_id[:8]}"
     created = int(time.time())
