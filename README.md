@@ -2,70 +2,11 @@
 
 An OpenAI-compatible LLM inference server built for Apple Silicon using MLX.
 
-> The missing piece between training (FineTuneKit) and orchestration (ASTRA) — a production-grade serving layer for on-device LLMs.
+> The missing piece between training ([FineTuneKit](https://github.com/TDevViper/FineTuneKit)) and orchestration ([ASTRA](https://github.com/TDevViper/ASTRA)) — a production-grade serving layer for on-device LLMs.
 
-## Features
-
-- ✅ OpenAI-compatible API (`/v1/chat/completions`, `/v1/models`)
-- ✅ MLX backend — runs natively on Apple Silicon Metal GPU
-- ✅ Loads models in under 1 second
-- 🔄 Request queue + concurrent handling (Week 2)
-- 🔄 Token-by-token SSE streaming (Week 2)
-- 🔄 KV cache manager (Week 5-7)
-- 🔄 Continuous batching (Week 8-9)
-- 🔄 Real-time dashboard — tokens/sec, queue depth, memory (Week 10-11)
-
-## Quickstart
-```bash
-git clone https://github.com/TDevViper/MLX-Serve.git
-cd MLX-Serve
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-python main.py
-```
-
-## Usage
-```bash
-curl -X POST http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "mlx-community/Qwen1.5-0.5B-Chat",
-    "messages": [{"role": "user", "content": "Hello!"}],
-    "max_tokens": 200
-  }'
-```
-
-## OpenAI SDK compatible
-```python
-from openai import OpenAI
-
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="none")
-response = client.chat.completions.create(
-    model="mlx-community/Qwen1.5-0.5B-Chat",
-    messages=[{"role": "user", "content": "What is MLX?"}],
-)
-print(response.choices[0].message.content)
-```
-
-## Requirements
-
-- Apple Silicon Mac (M1/M2/M3/M4)
-- Python 3.10+
-
-## Project Structure
-```
-mlx-serve/
-├── api/          # FastAPI server + endpoints
-├── core/         # Config + OpenAI-compatible request/response models
-├── engine/       # Model runner (MLX inference)
-├── scheduler/    # Request queue + batching (Week 2)
-├── configs/      # YAML config
-└── tests/        # Test suite
-
-```
 ## Benchmarks
 
-> Apple M4 · MLX-Serve (Qwen 1.5 0.5B) vs Ollama (Llama 3.2 3B) · 128 output tokens · 3 rounds per concurrency level
+> Apple M4 · MLX-Serve vs Ollama · 128 output tokens · 3 rounds per concurrency level
 
 ![Benchmark](docs/benchmark_chart.png)
 
@@ -76,7 +17,62 @@ mlx-serve/
 | 4 users     | 91.4           | 43.7         | 3.51s         | 7.28s      | **2.1x** |
 | 8 users     | 89.4           | 39.5         | 6.38s         | 14.52s     | **2.3x** |
 
-MLX-Serve sustains **~90 tok/s** throughput flat across all concurrency levels via continuous batching.
-Ollama degrades under load — latency doubles from 1→8 users. MLX-Serve latency scales linearly.
+MLX-Serve sustains ~90 tok/s flat across all concurrency levels via continuous batching.
+Ollama degrades under load — latency doubles from 1 to 8 users. MLX-Serve scales linearly.
+
+## Architecture
+
+![Architecture](docs/architecture.png)
+
+## Features
+
+| Feature | Detail |
+|---------|--------|
+| OpenAI-compatible API | /v1/chat/completions, /v1/completions, /v1/models, /v1/embeddings |
+| MLX backend | Runs natively on Apple Silicon Metal GPU |
+| Sub-second load time | Model ready in under 1 second |
+| Request queue + SSE streaming | Token-by-token streaming, concurrent handling |
+| Prometheus metrics | /metrics, tokens/sec, latency, p99 |
+| KV cache manager | PagedAttention-style block allocator with LRU eviction |
+| Memory monitor + preemption | Pressure levels, auto-preemptor |
+| Continuous batching | Iteration-level scheduling, multiple sequences per step |
+| Prefix caching | 9x iteration speedup on shared prompt prefixes |
+| React dashboard | Live metrics, charts, queue depth, memory gauge |
+
+## Quickstart
+
+git clone https://github.com/TDevViper/MLX-Serve.git
+cd MLX-Serve
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+python main.py
+
+## API Surface
+
+GET  /health
+GET  /metrics
+GET  /v1/models
+POST /v1/chat/completions
+POST /v1/chat/completions/batched
+POST /v1/completions
+POST /v1/embeddings
+GET  /v1/stats
+GET  /v1/kv_cache
+GET  /v1/memory
+GET  /v1/batcher
+GET  /v1/prefix_cache
+
+## Requirements
+
+- Apple Silicon Mac (M1/M2/M3/M4)
+- Python 3.10+
+- Node.js 18+ (dashboard only)
+
+## Ecosystem
+
+FineTuneKit  ->  fine-tune a model on your data
+MLX-Serve    ->  serve it at production throughput   <- you are here
+ASTRA        ->  build an agent on top of it
+
 ---
-Built on Apple Silicon · Part of the FineTuneKit ecosystem
+Built on Apple Silicon · MIT License
