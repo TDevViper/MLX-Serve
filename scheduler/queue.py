@@ -33,7 +33,7 @@ class InferenceRequest:
             self.token_queue = asyncio.Queue()
 
 class RequestQueue:
-    def __init__(self, max_concurrent: int = 2):
+    def __init__(self, max_concurrent: int = 1):  # MLX GPU is not thread-safe — serial only
         self.max_concurrent = max_concurrent
         self._queue: asyncio.Queue = asyncio.Queue()
         self._active: dict[str, InferenceRequest] = {}

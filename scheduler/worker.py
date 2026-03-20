@@ -4,6 +4,7 @@ import time
 from scheduler.queue import RequestQueue, RequestStatus, InferenceRequest
 from engine.model_runner import runner
 from core.metrics import metrics, RequestMetric
+from core.stats import stats
 
 logger = logging.getLogger(__name__)
 
@@ -49,27 +50,32 @@ class InferenceWorker:
                 tps = round(req.completion_tokens / max(elapsed, 0.01), 1)
                 logger.info(f"[{req.request_id[:8]}] {req.completion_tokens} tokens in {elapsed}s ({tps} tok/s)")
                 metrics.record(RequestMetric(
-                    request_id=req.request_id,
+                    request_id=req.request_id, model=runner.model_name,
+                    prompt_tokens=req.prompt_tokens,
+                    completion_tokens=req.completion_tokens,
+                    elapsed=elapsed, tokens_per_sec=tps,
+                ))
+                stats.record(
                     model=runner.model_name,
                     prompt_tokens=req.prompt_tokens,
                     completion_tokens=req.completion_tokens,
-                    elapsed=elapsed,
-                    tokens_per_sec=tps,
-                ))
+                    latency=elapsed,
+                )
 
         except Exception as e:
             req.error = str(e)
             req.status = RequestStatus.FAILED
             logger.error(f"[{req.request_id[:8]}] Failed: {e}")
             metrics.record(RequestMetric(
-                request_id=req.request_id,
+                request_id=req.request_id, model=runner.model_name or "unknown",
+                prompt_tokens=req.prompt_tokens, completion_tokens=0,
+                elapsed=0, tokens_per_sec=0, status="failed",
+            ))
+            stats.record(
                 model=runner.model_name or "unknown",
                 prompt_tokens=req.prompt_tokens,
-                completion_tokens=0,
-                elapsed=0,
-                tokens_per_sec=0,
-                status="failed",
-            ))
+                completion_tokens=0, latency=0, failed=True,
+            )
             if req.stream and req.token_queue:
                 await req.token_queue.put(None)
         finally:
@@ -85,9 +91,7 @@ class InferenceWorker:
         def _stream():
             for response in stream_generate(
                 runner.model, runner.tokenizer,
-                prompt=req.prompt,
-                max_tokens=req.max_tokens,
-                sampler=sampler,
+                prompt=req.prompt, max_tokens=req.max_tokens, sampler=sampler,
             ):
                 full_text.append(response.text)
                 loop.call_soon_threadsafe(req.token_queue.put_nowait, response.text)
@@ -101,10 +105,14 @@ class InferenceWorker:
         tps = round(req.completion_tokens / max(req.elapsed, 0.01), 1)
         logger.info(f"[{req.request_id[:8]}] streamed {req.completion_tokens} tokens in {req.elapsed}s ({tps} tok/s)")
         metrics.record(RequestMetric(
-            request_id=req.request_id,
+            request_id=req.request_id, model=runner.model_name,
+            prompt_tokens=req.prompt_tokens,
+            completion_tokens=req.completion_tokens,
+            elapsed=req.elapsed, tokens_per_sec=tps,
+        ))
+        stats.record(
             model=runner.model_name,
             prompt_tokens=req.prompt_tokens,
             completion_tokens=req.completion_tokens,
-            elapsed=req.elapsed,
-            tokens_per_sec=tps,
-        ))
+            latency=req.elapsed,
+        )

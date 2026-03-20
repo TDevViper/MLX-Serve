@@ -8,6 +8,7 @@ from core.models import (
     ModelList, ModelCard
 )
 from core.metrics import metrics
+from core.stats import stats
 from engine.model_runner import runner
 from core.config import load_config
 from scheduler.queue import RequestQueue, InferenceRequest
@@ -57,6 +58,15 @@ async def health():
 async def prometheus_metrics():
     """Prometheus-compatible metrics endpoint."""
     return metrics.prometheus(queue.stats())
+
+@app.get("/v1/stats")
+async def model_stats():
+    """Per-model request breakdown."""
+    return {
+        "models": stats.all(),
+        "summary": metrics.summary(),
+        "queue": queue.stats(),
+    }
 
 @app.get("/v1/models", response_model=ModelList)
 async def list_models():
