@@ -13,6 +13,7 @@ from engine.model_runner import runner
 from engine.kv_cache import kv_cache
 from engine.memory_monitor import MemoryMonitor
 from engine.embedder import embedder
+from scheduler.continuous_batcher import batcher, Sequence as BatchSequence
 from core.config import load_config
 from scheduler.queue import RequestQueue, InferenceRequest
 from scheduler.worker import InferenceWorker
@@ -53,6 +54,7 @@ async def startup():
     await loop.run_in_executor(None, runner.load, cfg.model.default)
     await loop.run_in_executor(None, embedder.load, "sentence-transformers/all-MiniLM-L6-v2")
     await worker.start()
+    await batcher.start()
     await mem_monitor.start()
     preemptor.attach(queue, mem_monitor)
     logger.info(f"Server ready — model: {cfg.model.default}")
@@ -60,6 +62,7 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     await worker.stop()
+    await batcher.stop()
     await mem_monitor.stop()
 
 # ── Health & metrics ──────────────────────────────────────────────────────────
@@ -183,6 +186,60 @@ async def create_embeddings(req: EmbeddingRequest):
     }
 
 # ── Stats endpoints ───────────────────────────────────────────────────────────
+@app.get("/v1/batcher")
+async def batcher_stats():
+    """Continuous batcher stats — batch size, throughput, iterations."""
+    return batcher.stats()
+
+@app.post("/v1/chat/completions/batched")
+async def chat_completions_batched(req: ChatCompletionRequest):
+    """
+    Route through the continuous batcher instead of the serial queue.
+    Enables true multi-request batching.
+    """
+    if not runner.is_loaded():
+        raise HTTPException(503, "Model not loaded yet")
+    messages = [{"role": m.role, "content": m.content} for m in req.messages]
+    prompt   = runner.format_prompt(messages)
+    prompt_tokens = runner.count_tokens(prompt)
+    seq = BatchSequence(
+        seq_id=uuid.uuid4().hex,
+        prompt=prompt,
+        prompt_tokens=prompt_tokens,
+        max_tokens=req.max_tokens,
+        temperature=req.temperature,
+        stream=req.stream,
+    )
+    await batcher.submit(seq)
+    if req.stream:
+        return EventSourceResponse(_stream_batch(seq, req.model))
+    result = await batcher.wait_for_result(seq.seq_id)
+    if result is None:
+        raise HTTPException(504, "Request timed out")
+    return ChatCompletionResponse.build(
+        model=req.model,
+        content=result.output_text,
+        prompt_tokens=result.prompt_tokens,
+        completion_tokens=result.generated_tokens,
+    )
+
+async def _stream_batch(seq, model_name: str):
+    req_id  = f"chatcmpl-{seq.seq_id[:8]}"
+    created = int(time.time())
+    while seq.token_queue is None:
+        await asyncio.sleep(0.01)
+    while True:
+        token = await seq.token_queue.get()
+        if token is None:
+            yield {"data": json.dumps({"id": req_id, "object": "chat.completion.chunk",
+                "created": created, "model": model_name,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})}
+            yield {"data": "[DONE]"}
+            break
+        yield {"data": json.dumps({"id": req_id, "object": "chat.completion.chunk",
+            "created": created, "model": model_name,
+            "choices": [{"index": 0, "delta": {"content": token}, "finish_reason": None}]})}
+
 @app.get("/v1/kv_cache")
 async def kv_cache_stats():
     s = kv_cache.stats()
