@@ -8,12 +8,14 @@ from core.models import (
     ModelList, ModelCard
 )
 from core.metrics import metrics
-from engine.kv_cache import kv_cache
 from core.stats import stats
 from engine.model_runner import runner
+from engine.kv_cache import kv_cache
+from engine.memory_monitor import MemoryMonitor
 from core.config import load_config
 from scheduler.queue import RequestQueue, InferenceRequest
 from scheduler.worker import InferenceWorker
+from scheduler.preemptor import Preemptor
 from pydantic import BaseModel
 from typing import Optional
 
@@ -21,7 +23,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 cfg    = load_config()
-app    = FastAPI(title="MLX-Serve", version="0.3.0")
+app    = FastAPI(title="MLX-Serve", version="0.6.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 AVAILABLE_MODELS = [
@@ -31,18 +33,23 @@ AVAILABLE_MODELS = [
     "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit",
 ]
 
-queue  = RequestQueue(max_concurrent=cfg.server.max_concurrent_requests)
-worker = InferenceWorker(queue)
+queue      = RequestQueue(max_concurrent=cfg.server.max_concurrent_requests)
+worker     = InferenceWorker(queue)
+mem_monitor = MemoryMonitor(kv_cache, poll_interval=1.0)
+preemptor  = Preemptor(kv_cache)
 
 @app.on_event("startup")
 async def startup():
     await asyncio.get_event_loop().run_in_executor(None, runner.load, cfg.model.default)
     await worker.start()
+    await mem_monitor.start()
+    preemptor.attach(queue, mem_monitor)
     logger.info(f"Server ready — model: {cfg.model.default}")
 
 @app.on_event("shutdown")
 async def shutdown():
     await worker.stop()
+    await mem_monitor.stop()
 
 @app.get("/health")
 async def health():
@@ -53,28 +60,16 @@ async def health():
         "load_time": runner.load_time,
         "queue":     queue.stats(),
         "metrics":   metrics.summary(),
+        "memory":    mem_monitor.current(),
     }
 
 @app.get("/metrics", response_class=PlainTextResponse)
 async def prometheus_metrics():
-    """Prometheus-compatible metrics endpoint."""
-    return metrics.prometheus(queue.stats())
-
-@app.get("/v1/kv_cache")
-async def kv_cache_stats():
-    """Real-time KV cache memory stats."""
-    s = kv_cache.stats()
-    s["memory_efficiency"] = f"{round((1 - s['utilization']) * 100, 1)}% free"
-    return s
-
-@app.get("/v1/stats")
-async def model_stats():
-    """Per-model request breakdown."""
-    return {
-        "models": stats.all(),
-        "summary": metrics.summary(),
-        "queue": queue.stats(),
-    }
+    return metrics.prometheus_with_kv(
+        queue_stats=queue.stats(),
+        kv_stats=kv_cache.stats(),
+        mem_stats=mem_monitor.stats(),
+    )
 
 @app.get("/v1/models", response_model=ModelList)
 async def list_models():
@@ -82,7 +77,24 @@ async def list_models():
         ModelCard(id=m, created=int(time.time())) for m in AVAILABLE_MODELS
     ])
 
-# ── /v1/chat/completions ──────────────────────────────────────────────────────
+@app.get("/v1/kv_cache")
+async def kv_cache_stats():
+    s = kv_cache.stats()
+    s["memory_efficiency"] = f"{round((1 - s['utilization']) * 100, 1)}% free"
+    return s
+
+@app.get("/v1/memory")
+async def memory_stats():
+    return mem_monitor.stats()
+
+@app.get("/v1/stats")
+async def model_stats():
+    return {
+        "models":  stats.all(),
+        "summary": metrics.summary(),
+        "queue":   queue.stats(),
+    }
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest):
     if not runner.is_loaded():
@@ -102,10 +114,10 @@ async def chat_completions(req: ChatCompletionRequest):
         raise HTTPException(500, inf_req.error)
     return ChatCompletionResponse.build(
         model=req.model, content=inf_req.result,
-        prompt_tokens=inf_req.prompt_tokens, completion_tokens=inf_req.completion_tokens,
+        prompt_tokens=inf_req.prompt_tokens,
+        completion_tokens=inf_req.completion_tokens,
     )
 
-# ── /v1/completions (raw text, no chat template) ─────────────────────────────
 class CompletionRequest(BaseModel):
     model: str = "mlx-community/Qwen1.5-0.5B-Chat"
     prompt: str
@@ -141,7 +153,7 @@ async def completions(req: CompletionRequest):
         }
     }
 
-async def _stream_tokens(inf_req: InferenceRequest, model_name: str):
+async def _stream_tokens(inf_req, model_name):
     req_id  = f"chatcmpl-{inf_req.request_id[:8]}"
     created = int(time.time())
     while inf_req.token_queue is None:
@@ -158,7 +170,7 @@ async def _stream_tokens(inf_req: InferenceRequest, model_name: str):
             "created": created, "model": model_name,
             "choices": [{"index": 0, "delta": {"content": token}, "finish_reason": None}]})}
 
-async def _stream_completion(inf_req: InferenceRequest, model_name: str):
+async def _stream_completion(inf_req, model_name):
     req_id  = f"cmpl-{inf_req.request_id[:8]}"
     created = int(time.time())
     while inf_req.token_queue is None:

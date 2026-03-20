@@ -123,5 +123,31 @@ class MetricsCollector:
         ]
         return "\n".join(lines) + "\n"
 
+    def prometheus_with_kv(self, queue_stats: dict, kv_stats: dict, mem_stats: dict) -> str:
+        base = self.prometheus(queue_stats)
+        kv_lines = [
+            "",
+            "# HELP mlx_serve_kv_blocks_total Total KV cache blocks",
+            "# TYPE mlx_serve_kv_blocks_total gauge",
+            f"mlx_serve_kv_blocks_total {kv_stats.get('total_blocks', 0)}",
+            "",
+            "# HELP mlx_serve_kv_blocks_used Used KV cache blocks",
+            "# TYPE mlx_serve_kv_blocks_used gauge",
+            f"mlx_serve_kv_blocks_used {kv_stats.get('used_blocks', 0)}",
+            "",
+            "# HELP mlx_serve_kv_utilization KV cache utilization 0-1",
+            "# TYPE mlx_serve_kv_utilization gauge",
+            f"mlx_serve_kv_utilization {kv_stats.get('utilization', 0)}",
+            "",
+            "# HELP mlx_serve_kv_evictions Total KV cache evictions",
+            "# TYPE mlx_serve_kv_evictions counter",
+            f"mlx_serve_kv_evictions {kv_stats.get('evictions', 0)}",
+            "",
+            "# HELP mlx_serve_memory_preemptions Total preemptions",
+            "# TYPE mlx_serve_memory_preemptions counter",
+            f"mlx_serve_memory_preemptions {mem_stats.get('preemptions', 0)}",
+        ]
+        return base + "\n".join(kv_lines) + "\n"
+
 # Global singleton
 metrics = MetricsCollector()
