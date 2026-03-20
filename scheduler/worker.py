@@ -3,6 +3,7 @@ import logging
 import time
 from scheduler.queue import RequestQueue, RequestStatus, InferenceRequest
 from engine.model_runner import runner
+from engine.kv_cache import kv_cache
 from core.metrics import metrics, RequestMetric
 from core.stats import stats
 
@@ -37,6 +38,12 @@ class InferenceWorker:
         loop = asyncio.get_event_loop()
         try:
             req.prompt_tokens = runner.count_tokens(req.prompt)
+
+            # Allocate KV cache blocks for this sequence
+            ok = kv_cache.init_sequence(req.request_id, req.prompt_tokens)
+            if not ok:
+                raise RuntimeError("KV cache OOM — no free blocks available")
+
             if req.stream:
                 await self._process_streaming(req, loop)
             else:
@@ -48,7 +55,11 @@ class InferenceWorker:
                 req.completion_tokens = runner.count_tokens(text)
                 req.status = RequestStatus.DONE
                 tps = round(req.completion_tokens / max(elapsed, 0.01), 1)
-                logger.info(f"[{req.request_id[:8]}] {req.completion_tokens} tokens in {elapsed}s ({tps} tok/s)")
+                logger.info(
+                    f"[{req.request_id[:8]}] {req.completion_tokens} tokens "
+                    f"in {elapsed}s ({tps} tok/s) | "
+                    f"KV blocks: {len(kv_cache.get_block_table(req.request_id) or [])}"
+                )
                 metrics.record(RequestMetric(
                     request_id=req.request_id, model=runner.model_name,
                     prompt_tokens=req.prompt_tokens,
@@ -67,9 +78,11 @@ class InferenceWorker:
             req.status = RequestStatus.FAILED
             logger.error(f"[{req.request_id[:8]}] Failed: {e}")
             metrics.record(RequestMetric(
-                request_id=req.request_id, model=runner.model_name or "unknown",
-                prompt_tokens=req.prompt_tokens, completion_tokens=0,
-                elapsed=0, tokens_per_sec=0, status="failed",
+                request_id=req.request_id,
+                model=runner.model_name or "unknown",
+                prompt_tokens=req.prompt_tokens,
+                completion_tokens=0, elapsed=0,
+                tokens_per_sec=0, status="failed",
             ))
             stats.record(
                 model=runner.model_name or "unknown",
@@ -79,6 +92,8 @@ class InferenceWorker:
             if req.stream and req.token_queue:
                 await req.token_queue.put(None)
         finally:
+            # Always free KV cache blocks when sequence is done
+            kv_cache.free_sequence(req.request_id)
             await self.queue.complete(req)
 
     async def _process_streaming(self, req: InferenceRequest, loop):
@@ -87,6 +102,7 @@ class InferenceWorker:
         sampler = make_sampler(req.temperature)
         t0 = time.time()
         full_text = []
+        token_count = [0]
 
         def _stream():
             for response in stream_generate(
@@ -94,16 +110,23 @@ class InferenceWorker:
                 prompt=req.prompt, max_tokens=req.max_tokens, sampler=sampler,
             ):
                 full_text.append(response.text)
+                token_count[0] += 1
+                # Track each generated token in KV cache
+                kv_cache.append_token(req.request_id)
                 loop.call_soon_threadsafe(req.token_queue.put_nowait, response.text)
             loop.call_soon_threadsafe(req.token_queue.put_nowait, None)
 
         await loop.run_in_executor(None, _stream)
         req.result = "".join(full_text)
         req.elapsed = round(time.time() - t0, 2)
-        req.completion_tokens = runner.count_tokens(req.result)
+        req.completion_tokens = token_count[0]
         req.status = RequestStatus.DONE
         tps = round(req.completion_tokens / max(req.elapsed, 0.01), 1)
-        logger.info(f"[{req.request_id[:8]}] streamed {req.completion_tokens} tokens in {req.elapsed}s ({tps} tok/s)")
+        logger.info(
+            f"[{req.request_id[:8]}] streamed {req.completion_tokens} tokens "
+            f"in {req.elapsed}s ({tps} tok/s) | "
+            f"KV blocks: {len(kv_cache.get_block_table(req.request_id) or [])}"
+        )
         metrics.record(RequestMetric(
             request_id=req.request_id, model=runner.model_name,
             prompt_tokens=req.prompt_tokens,

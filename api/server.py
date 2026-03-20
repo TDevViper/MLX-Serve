@@ -8,6 +8,7 @@ from core.models import (
     ModelList, ModelCard
 )
 from core.metrics import metrics
+from engine.kv_cache import kv_cache
 from core.stats import stats
 from engine.model_runner import runner
 from core.config import load_config
@@ -58,6 +59,13 @@ async def health():
 async def prometheus_metrics():
     """Prometheus-compatible metrics endpoint."""
     return metrics.prometheus(queue.stats())
+
+@app.get("/v1/kv_cache")
+async def kv_cache_stats():
+    """Real-time KV cache memory stats."""
+    s = kv_cache.stats()
+    s["memory_efficiency"] = f"{round((1 - s['utilization']) * 100, 1)}% free"
+    return s
 
 @app.get("/v1/stats")
 async def model_stats():
