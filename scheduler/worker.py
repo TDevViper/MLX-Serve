@@ -3,6 +3,7 @@ import logging
 import time
 from scheduler.queue import RequestQueue, RequestStatus, InferenceRequest
 from engine.model_runner import runner
+from core.metrics import metrics, RequestMetric
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +36,6 @@ class InferenceWorker:
         loop = asyncio.get_event_loop()
         try:
             req.prompt_tokens = runner.count_tokens(req.prompt)
-
             if req.stream:
                 await self._process_streaming(req, loop)
             else:
@@ -46,38 +46,51 @@ class InferenceWorker:
                 req.elapsed = elapsed
                 req.completion_tokens = runner.count_tokens(text)
                 req.status = RequestStatus.DONE
-                logger.info(f"[{req.request_id[:8]}] {req.completion_tokens} tokens in {elapsed}s ({round(req.completion_tokens/max(elapsed,0.01),1)} tok/s)")
+                tps = round(req.completion_tokens / max(elapsed, 0.01), 1)
+                logger.info(f"[{req.request_id[:8]}] {req.completion_tokens} tokens in {elapsed}s ({tps} tok/s)")
+                metrics.record(RequestMetric(
+                    request_id=req.request_id,
+                    model=runner.model_name,
+                    prompt_tokens=req.prompt_tokens,
+                    completion_tokens=req.completion_tokens,
+                    elapsed=elapsed,
+                    tokens_per_sec=tps,
+                ))
 
         except Exception as e:
             req.error = str(e)
             req.status = RequestStatus.FAILED
             logger.error(f"[{req.request_id[:8]}] Failed: {e}")
+            metrics.record(RequestMetric(
+                request_id=req.request_id,
+                model=runner.model_name or "unknown",
+                prompt_tokens=req.prompt_tokens,
+                completion_tokens=0,
+                elapsed=0,
+                tokens_per_sec=0,
+                status="failed",
+            ))
             if req.stream and req.token_queue:
                 await req.token_queue.put(None)
         finally:
             await self.queue.complete(req)
 
     async def _process_streaming(self, req: InferenceRequest, loop):
-        """Stream tokens one by one via the token_queue."""
         from mlx_lm.generate import stream_generate
         from mlx_lm.sample_utils import make_sampler
-
         sampler = make_sampler(req.temperature)
         t0 = time.time()
         full_text = []
 
         def _stream():
             for response in stream_generate(
-                runner.model,
-                runner.tokenizer,
+                runner.model, runner.tokenizer,
                 prompt=req.prompt,
                 max_tokens=req.max_tokens,
                 sampler=sampler,
             ):
                 full_text.append(response.text)
-                # Put token into queue from sync thread
                 loop.call_soon_threadsafe(req.token_queue.put_nowait, response.text)
-            # Signal done
             loop.call_soon_threadsafe(req.token_queue.put_nowait, None)
 
         await loop.run_in_executor(None, _stream)
@@ -85,4 +98,13 @@ class InferenceWorker:
         req.elapsed = round(time.time() - t0, 2)
         req.completion_tokens = runner.count_tokens(req.result)
         req.status = RequestStatus.DONE
-        logger.info(f"[{req.request_id[:8]}] streamed {req.completion_tokens} tokens in {req.elapsed}s")
+        tps = round(req.completion_tokens / max(req.elapsed, 0.01), 1)
+        logger.info(f"[{req.request_id[:8]}] streamed {req.completion_tokens} tokens in {req.elapsed}s ({tps} tok/s)")
+        metrics.record(RequestMetric(
+            request_id=req.request_id,
+            model=runner.model_name,
+            prompt_tokens=req.prompt_tokens,
+            completion_tokens=req.completion_tokens,
+            elapsed=req.elapsed,
+            tokens_per_sec=tps,
+        ))
