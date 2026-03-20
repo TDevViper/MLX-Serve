@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+mlx
+mlx-lm
+pydantic
+python-multipart
+sse-starlette
+httpx
+pytest
+pyyaml
